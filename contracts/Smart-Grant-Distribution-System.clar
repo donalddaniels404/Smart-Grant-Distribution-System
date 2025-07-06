@@ -133,3 +133,201 @@
 (define-read-only (is-validator (address principal))
     (default-to false (map-get? validators address))
 )
+
+(define-constant ERR-GRANT-EXPIRED (err u106))
+(define-constant ERR-INVALID-DEADLINE (err u107))
+
+(define-map grant-deadlines
+    { grant-id: uint }
+    {
+        created-at: uint,
+        deadline: uint,
+        expired: bool
+    }
+)
+
+(define-public (create-grant-with-deadline (recipient principal) (total-amount uint) (milestone-count uint) (deadline-blocks uint))
+    (let ((grant-id (+ (var-get total-grants) u1))
+          (current-block stacks-block-height)
+          (deadline (+ current-block deadline-blocks)))
+        (asserts! (> total-amount u0) ERR-INVALID-AMOUNT)
+        (asserts! (> milestone-count u0) ERR-INVALID-AMOUNT)
+        (asserts! (> deadline-blocks u0) ERR-INVALID-DEADLINE)
+        (map-set grants
+            { grant-id: grant-id }
+            {
+                recipient: recipient,
+                total-amount: total-amount,
+                remaining-amount: total-amount,
+                milestone-count: milestone-count,
+                status: "ACTIVE"
+            }
+        )
+        (map-set grant-deadlines
+            { grant-id: grant-id }
+            {
+                created-at: current-block,
+                deadline: deadline,
+                expired: false
+            }
+        )
+        (var-set total-grants grant-id)
+        (ok grant-id)
+    )
+)
+
+(define-public (expire-grant (grant-id uint))
+    (let (
+        (grant (unwrap! (get-grant grant-id) ERR-INVALID-GRANT))
+        (deadline-info (unwrap! (get-grant-deadline grant-id) ERR-INVALID-GRANT))
+    )
+        (asserts! (>= stacks-block-height (get deadline deadline-info)) ERR-INVALID-GRANT)
+        (asserts! (not (get expired deadline-info)) ERR-ALREADY-INITIALIZED)
+        (map-set grants
+            { grant-id: grant-id }
+            (merge grant { status: "EXPIRED" })
+        )
+        (map-set grant-deadlines
+            { grant-id: grant-id }
+            (merge deadline-info { expired: true })
+        )
+        (ok true)
+    )
+)
+
+(define-public (extend-grant-deadline (grant-id uint) (additional-blocks uint))
+    (let (
+        (grant (unwrap! (get-grant grant-id) ERR-INVALID-GRANT))
+        (deadline-info (unwrap! (get-grant-deadline grant-id) ERR-INVALID-GRANT))
+    )
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+        (asserts! (not (get expired deadline-info)) ERR-GRANT-EXPIRED)
+        (asserts! (> additional-blocks u0) ERR-INVALID-AMOUNT)
+        (map-set grant-deadlines
+            { grant-id: grant-id }
+            (merge deadline-info { 
+                deadline: (+ (get deadline deadline-info) additional-blocks)
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (get-grant-deadline (grant-id uint))
+    (map-get? grant-deadlines { grant-id: grant-id })
+)
+
+(define-read-only (is-grant-expired (grant-id uint))
+    (match (get-grant-deadline grant-id)
+        deadline-info (>= stacks-block-height (get deadline deadline-info))
+        false
+    )
+)
+
+(define-constant ERR-INSUFFICIENT-APPROVALS (err u108))
+(define-constant ERR-ALREADY-VOTED (err u109))
+(define-constant ERR-INVALID-THRESHOLD (err u110))
+
+(define-data-var approval-threshold uint u2)
+
+(define-map milestone-approvals
+    { grant-id: uint, milestone-id: uint }
+    {
+        approval-count: uint,
+        rejection-count: uint,
+        finalized: bool
+    }
+)
+
+(define-map validator-votes
+    { grant-id: uint, milestone-id: uint, validator: principal }
+    {
+        vote: bool,
+        voted: bool
+    }
+)
+
+(define-public (set-approval-threshold (new-threshold uint))
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+        (asserts! (> new-threshold u0) ERR-INVALID-THRESHOLD)
+        (var-set approval-threshold new-threshold)
+        (ok true)
+    )
+)
+
+(define-public (vote-milestone (grant-id uint) (milestone-id uint) (approve bool))
+    (let (
+        (grant (unwrap! (get-grant grant-id) ERR-INVALID-GRANT))
+        (milestone (unwrap! (get-milestone grant-id milestone-id) ERR-MILESTONE-NOT-FOUND))
+        (current-approvals (default-to 
+            { approval-count: u0, rejection-count: u0, finalized: false }
+            (map-get? milestone-approvals { grant-id: grant-id, milestone-id: milestone-id })
+        ))
+        (existing-vote (map-get? validator-votes { grant-id: grant-id, milestone-id: milestone-id, validator: tx-sender }))
+    )
+        (asserts! (default-to false (map-get? validators tx-sender)) ERR-NOT-AUTHORIZED)
+        (asserts! (get completed milestone) ERR-MILESTONE-NOT-FOUND)
+        (asserts! (not (get finalized current-approvals)) ERR-MILESTONE-ALREADY-COMPLETED)
+        (asserts! (is-none existing-vote) ERR-ALREADY-VOTED)
+        
+        (map-set validator-votes
+            { grant-id: grant-id, milestone-id: milestone-id, validator: tx-sender }
+            { vote: approve, voted: true }
+        )
+        
+        (let ((new-approvals (if approve
+            (merge current-approvals { approval-count: (+ (get approval-count current-approvals) u1) })
+            (merge current-approvals { rejection-count: (+ (get rejection-count current-approvals) u1) })
+        )))
+            (map-set milestone-approvals
+                { grant-id: grant-id, milestone-id: milestone-id }
+                new-approvals
+            )
+            (begin
+                (if (>= (get approval-count new-approvals) (var-get approval-threshold))
+                    (try! (finalize-milestone-approval grant-id milestone-id))
+                    true
+                )
+                (ok true)
+            )
+        )
+    )
+)
+
+(define-private (finalize-milestone-approval (grant-id uint) (milestone-id uint))
+    (let (
+        (grant (unwrap! (get-grant grant-id) ERR-INVALID-GRANT))
+        (milestone (unwrap! (get-milestone grant-id milestone-id) ERR-MILESTONE-NOT-FOUND))
+        (approvals (unwrap! (map-get? milestone-approvals { grant-id: grant-id, milestone-id: milestone-id }) ERR-MILESTONE-NOT-FOUND))
+    )
+        (try! (stx-transfer? (get amount milestone) tx-sender (get recipient grant)))
+        (map-set milestones
+            { grant-id: grant-id, milestone-id: milestone-id }
+            (merge milestone { approved: true })
+        )
+        (map-set milestone-approvals
+            { grant-id: grant-id, milestone-id: milestone-id }
+            (merge approvals { finalized: true })
+        )
+        (map-set grants
+            { grant-id: grant-id }
+            (merge grant { 
+                remaining-amount: (- (get remaining-amount grant) (get amount milestone))
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (get-milestone-approvals (grant-id uint) (milestone-id uint))
+    (map-get? milestone-approvals { grant-id: grant-id, milestone-id: milestone-id })
+)
+
+(define-read-only (get-validator-vote (grant-id uint) (milestone-id uint) (validator principal))
+    (map-get? validator-votes { grant-id: grant-id, milestone-id: milestone-id, validator: validator })
+)
+
+(define-read-only (get-approval-threshold)
+    (var-get approval-threshold)
+)
