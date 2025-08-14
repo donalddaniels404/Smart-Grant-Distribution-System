@@ -227,6 +227,8 @@
 (define-constant ERR-INSUFFICIENT-APPROVALS (err u108))
 (define-constant ERR-ALREADY-VOTED (err u109))
 (define-constant ERR-INVALID-THRESHOLD (err u110))
+(define-constant ERR-REPORT-NOT-FOUND (err u111))
+(define-constant ERR-REPORT-ALREADY-SUBMITTED (err u112))
 
 (define-data-var approval-threshold uint u2)
 
@@ -244,6 +246,17 @@
     {
         vote: bool,
         voted: bool
+    }
+)
+
+(define-map milestone-reports
+    { grant-id: uint, milestone-id: uint }
+    {
+        progress-percentage: uint,
+        deliverable-url: (string-ascii 200),
+        notes: (string-ascii 500),
+        submitted-at: uint,
+        submitted: bool
     }
 )
 
@@ -330,4 +343,108 @@
 
 (define-read-only (get-approval-threshold)
     (var-get approval-threshold)
+)
+
+(define-public (submit-milestone-report 
+    (grant-id uint) 
+    (milestone-id uint) 
+    (progress-percentage uint) 
+    (deliverable-url (string-ascii 200)) 
+    (notes (string-ascii 500))
+)
+    (let (
+        (grant (unwrap! (get-grant grant-id) ERR-INVALID-GRANT))
+        (milestone (unwrap! (get-milestone grant-id milestone-id) ERR-MILESTONE-NOT-FOUND))
+        (existing-report (map-get? milestone-reports { grant-id: grant-id, milestone-id: milestone-id }))
+    )
+        (asserts! (is-eq tx-sender (get recipient grant)) ERR-NOT-AUTHORIZED)
+        (asserts! (not (get completed milestone)) ERR-MILESTONE-ALREADY-COMPLETED)
+        (asserts! (<= progress-percentage u100) ERR-INVALID-AMOUNT)
+        (asserts! (is-none existing-report) ERR-REPORT-ALREADY-SUBMITTED)
+        (map-set milestone-reports
+            { grant-id: grant-id, milestone-id: milestone-id }
+            {
+                progress-percentage: progress-percentage,
+                deliverable-url: deliverable-url,
+                notes: notes,
+                submitted-at: stacks-block-height,
+                submitted: true
+            }
+        )
+        (ok true)
+    )
+)
+
+(define-public (update-milestone-report 
+    (grant-id uint) 
+    (milestone-id uint) 
+    (progress-percentage uint) 
+    (deliverable-url (string-ascii 200)) 
+    (notes (string-ascii 500))
+)
+    (let (
+        (grant (unwrap! (get-grant grant-id) ERR-INVALID-GRANT))
+        (milestone (unwrap! (get-milestone grant-id milestone-id) ERR-MILESTONE-NOT-FOUND))
+        (existing-report (unwrap! (map-get? milestone-reports { grant-id: grant-id, milestone-id: milestone-id }) ERR-REPORT-NOT-FOUND))
+    )
+        (asserts! (is-eq tx-sender (get recipient grant)) ERR-NOT-AUTHORIZED)
+        (asserts! (not (get completed milestone)) ERR-MILESTONE-ALREADY-COMPLETED)
+        (asserts! (<= progress-percentage u100) ERR-INVALID-AMOUNT)
+        (map-set milestone-reports
+            { grant-id: grant-id, milestone-id: milestone-id }
+            {
+                progress-percentage: progress-percentage,
+                deliverable-url: deliverable-url,
+                notes: notes,
+                submitted-at: (get submitted-at existing-report),
+                submitted: true
+            }
+        )
+        (ok true)
+    )
+)
+
+(define-public (submit-milestone-with-report 
+    (grant-id uint) 
+    (milestone-id uint) 
+    (progress-percentage uint) 
+    (deliverable-url (string-ascii 200)) 
+    (notes (string-ascii 500))
+)
+    (let (
+        (grant (unwrap! (get-grant grant-id) ERR-INVALID-GRANT))
+        (milestone (unwrap! (get-milestone grant-id milestone-id) ERR-MILESTONE-NOT-FOUND))
+        (existing-report (map-get? milestone-reports { grant-id: grant-id, milestone-id: milestone-id }))
+    )
+        (asserts! (is-eq tx-sender (get recipient grant)) ERR-NOT-AUTHORIZED)
+        (asserts! (not (get completed milestone)) ERR-MILESTONE-ALREADY-COMPLETED)
+        (asserts! (<= progress-percentage u100) ERR-INVALID-AMOUNT)
+        (asserts! (is-eq progress-percentage u100) ERR-INVALID-AMOUNT)
+        (map-set milestone-reports
+            { grant-id: grant-id, milestone-id: milestone-id }
+            {
+                progress-percentage: progress-percentage,
+                deliverable-url: deliverable-url,
+                notes: notes,
+                submitted-at: stacks-block-height,
+                submitted: true
+            }
+        )
+        (map-set milestones
+            { grant-id: grant-id, milestone-id: milestone-id }
+            (merge milestone { completed: true })
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (get-milestone-report (grant-id uint) (milestone-id uint))
+    (map-get? milestone-reports { grant-id: grant-id, milestone-id: milestone-id })
+)
+
+(define-read-only (has-milestone-report (grant-id uint) (milestone-id uint))
+    (match (get-milestone-report grant-id milestone-id)
+        report (get submitted report)
+        false
+    )
 )
