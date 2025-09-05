@@ -448,3 +448,163 @@
         false
     )
 )
+
+(define-constant ERR-INVALID-CATEGORY (err u113))
+(define-constant ERR-BUDGET-EXCEEDED (err u114))
+(define-constant ERR-CATEGORY-NOT-FOUND (err u115))
+
+(define-map grant-budget-categories
+    { grant-id: uint }
+    {
+        development-budget: uint,
+        testing-budget: uint,
+        marketing-budget: uint,
+        operations-budget: uint,
+        other-budget: uint
+    }
+)
+
+(define-map category-spending
+    { grant-id: uint }
+    {
+        development-spent: uint,
+        testing-spent: uint,
+        marketing-spent: uint,
+        operations-spent: uint,
+        other-spent: uint
+    }
+)
+
+(define-public (allocate-grant-budget 
+    (grant-id uint)
+    (development-budget uint)
+    (testing-budget uint)
+    (marketing-budget uint)
+    (operations-budget uint)
+    (other-budget uint)
+)
+    (let (
+        (grant (unwrap! (get-grant grant-id) ERR-INVALID-GRANT))
+        (total-allocated (+ development-budget (+ testing-budget (+ marketing-budget (+ operations-budget other-budget)))))
+    )
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq total-allocated (get total-amount grant)) ERR-INVALID-AMOUNT)
+        (map-set grant-budget-categories
+            { grant-id: grant-id }
+            {
+                development-budget: development-budget,
+                testing-budget: testing-budget,
+                marketing-budget: marketing-budget,
+                operations-budget: operations-budget,
+                other-budget: other-budget
+            }
+        )
+        (map-set category-spending
+            { grant-id: grant-id }
+            {
+                development-spent: u0,
+                testing-spent: u0,
+                marketing-spent: u0,
+                operations-spent: u0,
+                other-spent: u0
+            }
+        )
+        (ok true)
+    )
+)
+
+(define-public (add-categorized-milestone 
+    (grant-id uint) 
+    (milestone-id uint) 
+    (amount uint) 
+    (description (string-ascii 100))
+    (category (string-ascii 20))
+)
+    (let (
+        (grant (unwrap! (get-grant grant-id) ERR-INVALID-GRANT))
+        (budget (unwrap! (map-get? grant-budget-categories { grant-id: grant-id }) ERR-CATEGORY-NOT-FOUND))
+        (spending (default-to 
+            { development-spent: u0, testing-spent: u0, marketing-spent: u0, operations-spent: u0, other-spent: u0 }
+            (map-get? category-spending { grant-id: grant-id })
+        ))
+    )
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+        (if (is-eq category "development")
+            (asserts! (<= (+ (get development-spent spending) amount) (get development-budget budget)) ERR-BUDGET-EXCEEDED)
+            (if (is-eq category "testing")
+                (asserts! (<= (+ (get testing-spent spending) amount) (get testing-budget budget)) ERR-BUDGET-EXCEEDED)
+                (if (is-eq category "marketing")
+                    (asserts! (<= (+ (get marketing-spent spending) amount) (get marketing-budget budget)) ERR-BUDGET-EXCEEDED)
+                    (if (is-eq category "operations")
+                        (asserts! (<= (+ (get operations-spent spending) amount) (get operations-budget budget)) ERR-BUDGET-EXCEEDED)
+                        (if (is-eq category "other")
+                            (asserts! (<= (+ (get other-spent spending) amount) (get other-budget budget)) ERR-BUDGET-EXCEEDED)
+                            (asserts! false ERR-INVALID-CATEGORY)
+                        )
+                    )
+                )
+            )
+        )
+        (map-set milestones
+            { grant-id: grant-id, milestone-id: milestone-id }
+            {
+                amount: amount,
+                description: description,
+                completed: false,
+                approved: false
+            }
+        )
+        (let ((new-spending 
+            (if (is-eq category "development")
+                (merge spending { development-spent: (+ (get development-spent spending) amount) })
+                (if (is-eq category "testing")
+                    (merge spending { testing-spent: (+ (get testing-spent spending) amount) })
+                    (if (is-eq category "marketing")
+                        (merge spending { marketing-spent: (+ (get marketing-spent spending) amount) })
+                        (if (is-eq category "operations")
+                            (merge spending { operations-spent: (+ (get operations-spent spending) amount) })
+                            (merge spending { other-spent: (+ (get other-spent spending) amount) })
+                        )
+                    )
+                )
+            )
+        ))
+            (map-set category-spending { grant-id: grant-id } new-spending)
+            (ok true)
+        )
+    )
+)
+
+(define-read-only (get-grant-budget (grant-id uint))
+    (map-get? grant-budget-categories { grant-id: grant-id })
+)
+
+(define-read-only (get-category-spending (grant-id uint))
+    (map-get? category-spending { grant-id: grant-id })
+)
+
+(define-read-only (get-budget-utilization (grant-id uint))
+    (match (map-get? grant-budget-categories { grant-id: grant-id })
+        budget (match (map-get? category-spending { grant-id: grant-id })
+            spending (some {
+                development-utilization: (if (> (get development-budget budget) u0) 
+                    (/ (* (get development-spent spending) u100) (get development-budget budget)) 
+                    u0),
+                testing-utilization: (if (> (get testing-budget budget) u0) 
+                    (/ (* (get testing-spent spending) u100) (get testing-budget budget)) 
+                    u0),
+                marketing-utilization: (if (> (get marketing-budget budget) u0) 
+                    (/ (* (get marketing-spent spending) u100) (get marketing-budget budget)) 
+                    u0),
+                operations-utilization: (if (> (get operations-budget budget) u0) 
+                    (/ (* (get operations-spent spending) u100) (get operations-budget budget)) 
+                    u0),
+                other-utilization: (if (> (get other-budget budget) u0) 
+                    (/ (* (get other-spent spending) u100) (get other-budget budget)) 
+                    u0)
+            })
+            none
+        )
+        none
+    )
+)
