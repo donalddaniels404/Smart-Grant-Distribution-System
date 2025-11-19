@@ -1273,3 +1273,227 @@
         false
     )
 )
+
+(define-constant ERR-ESCROW-NOT-FOUND (err u126))
+(define-constant ERR-ESCROW-ALREADY-EXISTS (err u127))
+(define-constant ERR-INSUFFICIENT-ESCROW-BALANCE (err u128))
+(define-constant ERR-ESCROW-LOCKED (err u129))
+(define-constant ERR-SIGNATURE-LIMIT-EXCEEDED (err u130))
+(define-constant ERR-SIGNATURE-THRESHOLD-NOT-MET (err u131))
+(define-constant ERR-DUPLICATE-SIGNER (err u132))
+(define-constant ERR-INVALID-SIGNATURE-THRESHOLD (err u133))
+(define-constant ERR-RELEASE-ALREADY-REQUESTED (err u134))
+(define-constant ERR-RELEASE-NOT-FOUND (err u135))
+(define-constant ERR-UNAUTHORIZED-SIGNER (err u136))
+
+(define-data-var total-escrows uint u0)
+(define-data-var total-release-requests uint u0)
+
+(define-map escrow-accounts
+    { escrow-id: uint }
+    {
+        grant-id: uint,
+        milestone-id: uint,
+        amount: uint,
+        depositor: principal,
+        recipient: principal,
+        status: (string-ascii 20),
+        required-signatures: uint,
+        signatures-received: uint,
+        created-at: uint,
+        locked-until: uint,
+        escrow-purpose: (string-ascii 100)
+    }
+)
+
+(define-map escrow-signers
+    { escrow-id: uint, signer: principal }
+    {
+        authorized: bool,
+        signed: bool,
+        signed-at: uint
+    }
+)
+
+(define-map escrow-release-requests
+    { release-request-id: uint }
+    {
+        escrow-id: uint,
+        requested-by: principal,
+        requested-at: uint,
+        status: (string-ascii 20),
+        approval-count: uint,
+        rejection-count: uint,
+        release-reason: (string-ascii 200)
+    }
+)
+
+(define-map release-request-votes
+    { release-request-id: uint, voter: principal }
+    {
+        approval: bool,
+        voted-at: uint
+    }
+)
+
+(define-public (create-escrow
+    (grant-id uint)
+    (milestone-id uint)
+    (amount uint)
+    (recipient principal)
+    (required-signatures uint)
+    (lock-blocks uint)
+    (purpose (string-ascii 100))
+)
+    (let (
+        (escrow-id (+ (var-get total-escrows) u1))
+        (grant (unwrap! (get-grant grant-id) ERR-INVALID-GRANT))
+        (locked-until (+ stacks-block-height lock-blocks))
+    )
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+        (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+        (asserts! (> required-signatures u0) ERR-INVALID-SIGNATURE-THRESHOLD)
+        (asserts! (<= required-signatures u10) ERR-SIGNATURE-LIMIT-EXCEEDED)
+        (asserts! (> lock-blocks u0) ERR-INVALID-AMOUNT)
+        
+        (map-set escrow-accounts
+            { escrow-id: escrow-id }
+            {
+                grant-id: grant-id,
+                milestone-id: milestone-id,
+                amount: amount,
+                depositor: tx-sender,
+                recipient: recipient,
+                status: "ACTIVE",
+                required-signatures: required-signatures,
+                signatures-received: u0,
+                created-at: stacks-block-height,
+                locked-until: locked-until,
+                escrow-purpose: purpose
+            }
+        )
+        
+        (var-set total-escrows escrow-id)
+        (ok escrow-id)
+    )
+)
+
+(define-public (add-escrow-signer (escrow-id uint) (signer principal))
+    (let ((escrow (unwrap! (get-escrow escrow-id) ERR-ESCROW-NOT-FOUND)))
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (get status escrow) "ACTIVE") ERR-ESCROW-LOCKED)
+        (asserts! (is-none (map-get? escrow-signers { escrow-id: escrow-id, signer: signer })) ERR-DUPLICATE-SIGNER)
+        
+        (map-set escrow-signers
+            { escrow-id: escrow-id, signer: signer }
+            {
+                authorized: true,
+                signed: false,
+                signed-at: u0
+            }
+        )
+        (ok true)
+    )
+)
+
+(define-public (approve-escrow-release (escrow-id uint) (reason (string-ascii 100)))
+    (let (
+        (escrow (unwrap! (get-escrow escrow-id) ERR-ESCROW-NOT-FOUND))
+        (signer-status (unwrap! (map-get? escrow-signers { escrow-id: escrow-id, signer: tx-sender }) ERR-UNAUTHORIZED-SIGNER))
+    )
+        (asserts! (is-eq (get status escrow) "ACTIVE") ERR-ESCROW-LOCKED)
+        (asserts! (not (get signed signer-status)) ERR-ALREADY-VOTED)
+        
+        (map-set escrow-signers
+            { escrow-id: escrow-id, signer: tx-sender }
+            {
+                authorized: true,
+                signed: true,
+                signed-at: stacks-block-height
+            }
+        )
+        
+        (let ((new-sig-count (+ (get signatures-received escrow) u1)))
+            (if (>= new-sig-count (get required-signatures escrow))
+                (begin
+                    (try! (release-escrow-funds escrow-id))
+                    (ok true)
+                )
+                (begin
+                    (map-set escrow-accounts
+                        { escrow-id: escrow-id }
+                        (merge escrow { signatures-received: new-sig-count })
+                    )
+                    (ok true)
+                )
+            )
+        )
+    )
+)
+
+(define-private (release-escrow-funds (escrow-id uint))
+    (let ((escrow (unwrap! (get-escrow escrow-id) ERR-ESCROW-NOT-FOUND)))
+        (try! (stx-transfer? (get amount escrow) tx-sender (get recipient escrow)))
+        
+        (map-set escrow-accounts
+            { escrow-id: escrow-id }
+            (merge escrow { status: "RELEASED" })
+        )
+        (ok true)
+    )
+)
+
+(define-public (refund-escrow (escrow-id uint) (refund-reason (string-ascii 200)))
+    (let ((escrow (unwrap! (get-escrow escrow-id) ERR-ESCROW-NOT-FOUND)))
+        (asserts! (or (is-eq tx-sender (var-get contract-owner))
+                     (is-eq tx-sender (get depositor escrow))) ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (get status escrow) "ACTIVE") ERR-ESCROW-LOCKED)
+        (asserts! (>= stacks-block-height (get locked-until escrow)) ERR-ESCROW-LOCKED)
+        
+        (try! (stx-transfer? (get amount escrow) tx-sender (get depositor escrow)))
+        
+        (map-set escrow-accounts
+            { escrow-id: escrow-id }
+            (merge escrow { status: "REFUNDED" })
+        )
+        (ok true)
+    )
+)
+
+(define-public (force-release-escrow (escrow-id uint) (approval-reason (string-ascii 200)))
+    (let ((escrow (unwrap! (get-escrow escrow-id) ERR-ESCROW-NOT-FOUND)))
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (get status escrow) "ACTIVE") ERR-ESCROW-LOCKED)
+        
+        (try! (stx-transfer? (get amount escrow) tx-sender (get recipient escrow)))
+        
+        (map-set escrow-accounts
+            { escrow-id: escrow-id }
+            (merge escrow { status: "FORCE-RELEASED" })
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (get-escrow (escrow-id uint))
+    (map-get? escrow-accounts { escrow-id: escrow-id })
+)
+
+(define-read-only (get-escrow-signer-status (escrow-id uint) (signer principal))
+    (map-get? escrow-signers { escrow-id: escrow-id, signer: signer })
+)
+
+(define-read-only (get-escrow-status (escrow-id uint))
+    (match (get-escrow escrow-id)
+        escrow (some {
+            escrow-id: escrow-id,
+            amount: (get amount escrow),
+            status: (get status escrow),
+            signatures-received: (get signatures-received escrow),
+            required-signatures: (get required-signatures escrow),
+            locked-until: (get locked-until escrow),
+            can-refund: (>= stacks-block-height (get locked-until escrow))
+        })
+        none
+    )
+)
